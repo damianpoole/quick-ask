@@ -326,7 +326,9 @@ Item {
 
         RowLayout {
           Layout.fillWidth: true
+          Layout.minimumHeight: root.headerHeight
           Layout.preferredHeight: root.headerHeight
+          Layout.maximumHeight: root.headerHeight
           spacing: Style.spacing.sm
 
           TextField {
