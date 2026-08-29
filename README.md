@@ -10,7 +10,7 @@ run one request at a time. Quick Ask bundles the recent transcript into the
 next prompt, keeping up to 24,000 characters of context. The transcript stays
 local to the running Omarchy shell and is not written to disk.
 
-![Quick Ask conversational overlay](assets/quick-ask.png)
+![Quick Ask conversational overlay](preview.png)
 
 ## Install
 
@@ -44,6 +44,22 @@ submission so it is ready for a follow-up.
 
 Supported agents: Codex, Claude, Gemini, OpenCode, Crush, Copilot, Grok, Pi,
 and OMP.
+
+## Remove
+
+Disable Quick Ask and remove its installed checkout:
+
+```bash
+omarchy plugin remove damianpoole.ask
+```
+
+Then remove the two Quick Ask lines from `~/.config/hypr/bindings.lua`.
+
+Your saved per-agent model preferences are preserved. To remove those as well:
+
+```bash
+rm -f ~/.config/omarchy/plugin-settings/damianpoole.ask.json
+```
 
 ## Local development
 
