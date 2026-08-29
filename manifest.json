@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "damianpoole.ask",
+  "name": "Ask",
+  "version": "1.3.0",
+  "author": "Damian Poole",
+  "license": "MIT",
+  "description": "Raycast-style overlay for quick Markdown answers from your configurable Omarchy default agent.",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Ask.qml"
+  }
+}
