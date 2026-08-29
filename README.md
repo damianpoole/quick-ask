@@ -10,6 +10,8 @@ run one request at a time. Quick Ask bundles the recent transcript into the
 next prompt, keeping up to 24,000 characters of context. The transcript stays
 local to the running Omarchy shell and is not written to disk.
 
+![Quick Ask conversational overlay](assets/quick-ask.png)
+
 ## Install
 
 ```bash
