@@ -155,7 +155,6 @@ Item {
 
     askProc.workingDirectory = root.workDir
     askProc.command = ["bash", root.askScript, prompt]
-    askProc.stdinEnabled = true
     if (askProc.running)
       askProc.running = false
 
@@ -247,7 +246,7 @@ Item {
     id: askProc
     running: false
     command: []
-    stdinEnabled: true
+    stdinEnabled: false
 
     stdout: StdioCollector {
       id: askStdout
@@ -258,8 +257,6 @@ Item {
       id: askStderr
       waitForEnd: true
     }
-
-    onStarted: stdinEnabled = false
 
     onExited: function(exitCode, exitStatus) {
       root.lastExitCode = exitCode
