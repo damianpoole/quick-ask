@@ -5,6 +5,11 @@ leaving the current workspace. It uses the agent selected by
 `omarchy-default-agent`, renders Markdown answers, and remembers a separate
 model preference for each supported agent.
 
+Follow-up messages are conversational even though the underlying agent CLIs
+run one request at a time. Quick Ask bundles the recent transcript into the
+next prompt, keeping up to 24,000 characters of context. The transcript stays
+local to the running Omarchy shell and is not written to disk.
+
 ## Install
 
 ```bash
@@ -30,6 +35,10 @@ are stored by agent in:
 Leaving the model blank uses that agent's configured default. Codex users can
 select a reasoning level or use the Luna/low quick preset. Custom model IDs are
 passed directly to the selected agent CLI.
+
+Press `Ctrl+N` or select **New** to clear the visible transcript and start a
+question without prior context. The input clears immediately after each
+submission so it is ready for a follow-up.
 
 Supported agents: Codex, Claude, Gemini, OpenCode, Crush, Copilot, Grok, Pi,
 and OMP.

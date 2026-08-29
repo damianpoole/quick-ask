@@ -15,7 +15,8 @@ Item {
 
   property bool opened: false
   property bool busy: false
-  property string query: ""
+  property var messages: []
+  property string pendingQuery: ""
   property string answer: ""
   property string errorText: ""
   property string agentName: ""
@@ -26,6 +27,7 @@ Item {
   property string configuredReasoning: ""
   property int askSeq: 0
   property int lastExitCode: 0
+  readonly property int maxContextCharacters: 24000
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string askScript: {
@@ -47,7 +49,7 @@ Item {
   property int headerHeight: Math.max(Style.space(44), Style.font.title + Style.spacing.controlPaddingY * 2)
   property int contentSpacing: Style.spacing.md
   property int cardWidth: Math.min(Style.space(720), panel.width - Style.gapsOut * 2)
-  readonly property bool showingResult: root.busy || root.answer !== "" || root.errorText !== ""
+  readonly property bool showingResult: root.busy || root.messages.length > 0 || root.errorText !== ""
   readonly property bool showingDetail: root.settingsOpen || root.showingResult
   property int cardHeight: {
     var compact = contentMargin * 2 + headerHeight + Style.font.caption + Style.spacing.sm
@@ -56,9 +58,9 @@ Item {
     return Math.min(Style.space(520), panel.height - Style.gapsOut * 2)
   }
   readonly property string hint: root.agentName
-    ? ("Enter to ask · Esc to close · " + root.agentName + " · "
+    ? ("Enter to ask · Ctrl+N new · Esc to close · " + root.agentName + " · "
       + (root.configuredModel || "agent default"))
-    : "Enter to ask · Esc to close · default Omarchy agent"
+    : "Enter to ask · Ctrl+N new · Esc to close · default Omarchy agent"
 
   function open(payloadJson) {
     root.opened = true
@@ -90,6 +92,55 @@ Item {
 
   function cleanText(text) {
     return String(text || "").replace(/\x1B\[[0-9;]*[A-Za-z]/g, "").trim()
+  }
+
+  function scrollToLatest() {
+    Qt.callLater(function() {
+      if (answerScroll)
+        answerScroll.contentY = Math.max(0, answerScroll.contentHeight - answerScroll.height)
+    })
+  }
+
+  function appendMessage(role, content) {
+    var next = root.messages.slice()
+    next.push({ role: String(role), content: String(content) })
+    root.messages = next
+    root.scrollToLatest()
+  }
+
+  function buildAgentPrompt(latestMessage) {
+    if (root.messages.length === 0)
+      return latestMessage
+
+    var context = []
+    var used = latestMessage.length
+    for (var i = root.messages.length - 1; i >= 0; i--) {
+      var message = root.messages[i]
+      var size = String(message.content || "").length + 64
+      if (context.length > 0 && used + size > root.maxContextCharacters)
+        break
+      context.unshift({ role: message.role, content: message.content })
+      used += size
+    }
+
+    return [
+      "Continue the Quick Ask conversation below.",
+      "Use the history as context and answer only the latest user message.",
+      "Conversation history (JSON):\n" + JSON.stringify(context),
+      "Latest user message:\n" + latestMessage
+    ].join("\n\n")
+  }
+
+  function startNewConversation() {
+    if (root.busy)
+      return
+    root.messages = []
+    root.pendingQuery = ""
+    root.answer = ""
+    root.errorText = ""
+    if (queryField)
+      queryField.text = ""
+    Qt.callLater(function() { if (queryField) queryField.forceActiveFocus() })
   }
 
   function applySettings(text) {
@@ -140,16 +191,17 @@ Item {
   }
 
   function submit() {
-    var prompt = (queryField ? queryField.text : root.query).trim()
-    if (!prompt)
-      return
-    if (root.busy && prompt === root.query)
+    var userMessage = (queryField ? queryField.text : "").trim()
+    if (!userMessage || root.busy)
       return
 
-    root.query = prompt
+    var prompt = root.buildAgentPrompt(userMessage)
+    root.pendingQuery = userMessage
     root.answer = ""
     root.errorText = ""
     root.busy = true
+    queryField.text = ""
+    root.appendMessage("user", userMessage)
     root.askSeq += 1
     var seq = root.askSeq
 
@@ -172,10 +224,15 @@ Item {
     if (exitCode === 0 && fromOut) {
       root.answer = fromOut
       root.errorText = ""
+      root.appendMessage("assistant", fromOut)
+      root.pendingQuery = ""
+      Qt.callLater(function() { if (queryField) queryField.forceActiveFocus() })
       return
     }
     root.answer = fromOut
     root.errorText = fromErr || ("Agent exited " + exitCode)
+    root.pendingQuery = ""
+    root.scrollToLatest()
   }
 
   function copyAnswer() {
@@ -339,7 +396,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
             foreground: root.foreground
-            placeholderText: "Ask a question…"
+            placeholderText: root.messages.length > 0 ? "Reply…" : "Ask a question…"
             onAccepted: root.submit()
             Keys.onReturnPressed: function(event) { root.submit(); event.accepted = true }
             Keys.onEnterPressed: function(event) { root.submit(); event.accepted = true }
@@ -350,6 +407,9 @@ Item {
                 event.accepted = true
               } else if (event.key === Qt.Key_Comma && (event.modifiers & Qt.ControlModifier)) {
                 root.showSettings()
+                event.accepted = true
+              } else if (event.key === Qt.Key_N && (event.modifiers & Qt.ControlModifier)) {
+                root.startNewConversation()
                 event.accepted = true
               } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier)) {
                 if (!queryField.selectedText && root.answer) {
@@ -368,6 +428,17 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
             verticalAlignment: Text.AlignVCenter
+          }
+
+          Button {
+            visible: !root.settingsOpen
+            Layout.preferredHeight: root.headerHeight
+            text: "New"
+            foreground: root.foreground
+            bordered: true
+            focusable: true
+            enabled: !root.busy && root.messages.length > 0
+            onClicked: root.startNewConversation()
           }
 
           Button {
@@ -517,16 +588,6 @@ Item {
           font.pixelSize: Style.font.caption
         }
 
-        Text {
-          Layout.fillWidth: true
-          visible: !root.settingsOpen && root.busy
-          text: root.agentName ? ("Asking " + root.agentName + "…") : "Asking…"
-          color: root.foreground
-          opacity: 0.72
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-        }
-
         Flickable {
           id: answerScroll
           Layout.fillWidth: true
@@ -541,7 +602,64 @@ Item {
           Column {
             id: answerColumn
             width: answerScroll.width
-            spacing: Style.spacing.sm
+            spacing: Style.spacing.md
+
+            Repeater {
+              model: root.messages
+
+              Item {
+                required property var modelData
+                width: answerColumn.width
+                height: messageBubble.height
+
+                Rectangle {
+                  id: messageBubble
+                  width: Math.round(parent.width * 0.78)
+                  height: messageText.implicitHeight + Style.spacing.controlPaddingY * 2
+                  radius: root.cornerRadius
+                  color: modelData.role === "user"
+                    ? Style.selectedFillFor(root.foreground, Color.accent)
+                    : Style.hoverFillFor(root.foreground, Color.accent)
+                  anchors.right: modelData.role === "user" ? parent.right : undefined
+                  anchors.left: modelData.role === "user" ? undefined : parent.left
+
+                  Text {
+                    id: messageText
+                    width: parent.width - Style.spacing.controlPaddingX * 2
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: modelData.content
+                    textFormat: modelData.role === "assistant" ? Text.MarkdownText : Text.PlainText
+                    wrapMode: Text.Wrap
+                    color: root.foreground
+                    linkColor: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    horizontalAlignment: modelData.role === "user" ? Text.AlignRight : Text.AlignLeft
+                    onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                  }
+                }
+              }
+            }
+
+            Rectangle {
+              width: parent.width
+              height: askingText.implicitHeight + Style.spacing.controlPaddingY * 2
+              radius: root.cornerRadius
+              color: Style.hoverFillFor(root.foreground, Color.accent)
+              visible: root.busy
+
+              Text {
+                id: askingText
+                width: parent.width - Style.spacing.controlPaddingX * 2
+                anchors.centerIn: parent
+                text: root.agentName ? ("Asking " + root.agentName + "…") : "Asking…"
+                color: root.foreground
+                opacity: 0.72
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+            }
 
             Text {
               width: parent.width
@@ -555,21 +673,8 @@ Item {
 
             Text {
               width: parent.width
-              visible: root.answer !== ""
-              text: root.answer
-              textFormat: Text.MarkdownText
-              wrapMode: Text.Wrap
-              color: root.foreground
-              linkColor: Color.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              onLinkActivated: function(link) { Qt.openUrlExternally(link) }
-            }
-
-            Text {
-              width: parent.width
-              visible: root.answer !== "" && !root.busy
-              text: "Ctrl+C copies the answer"
+              visible: root.messages.length > 0 && !root.busy && root.errorText === ""
+              text: "Reply above · Ctrl+N starts a new conversation · Ctrl+C copies the latest answer"
               color: root.foreground
               opacity: 0.5
               font.family: root.fontFamily
