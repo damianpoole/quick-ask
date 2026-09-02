@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
@@ -16,22 +18,28 @@ Item {
   property bool opened: false
   property bool busy: false
   property var messages: []
-  property string pendingQuery: ""
-  property string answer: ""
   property string errorText: ""
   property string agentName: ""
-  property bool settingsOpen: false
-  property bool settingsBusy: false
-  property string settingsStatus: ""
-  property string configuredModel: ""
-  property string configuredReasoning: ""
-  property int askSeq: 0
+  property string agentStatus: "Detecting default agent…"
+  property string pendingRequest: ""
+  property string processErrorBuffer: ""
+  property string pendingExternalUrl: ""
+  property string pendingExternalHost: ""
+  property bool receivedAskRecord: false
+  property bool discardAskResult: false
   property int lastExitCode: 0
+
+  readonly property int maxUserCharacters: 4000
   readonly property int maxContextCharacters: 24000
+  readonly property int maxAssistantCharacters: 131072
+  readonly property int maxTranscriptCharacters: 192000
+  readonly property int maxErrorCharacters: 4096
+  readonly property int maxProtocolCharacters: 530000
+  readonly property int maxLinkCharacters: 2048
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string askScript: {
-    var url = Qt.resolvedUrl("ask.sh").toString()
+  readonly property string helperScript: {
+    var url = Qt.resolvedUrl("quick_ask_helper.py").toString()
     if (url.indexOf("file://") === 0)
       return decodeURIComponent(url.slice(7))
     return url
@@ -50,23 +58,44 @@ Item {
   property int contentSpacing: Style.spacing.md
   property int cardWidth: Math.min(Style.space(720), panel.width - Style.gapsOut * 2)
   readonly property bool showingResult: root.busy || root.messages.length > 0 || root.errorText !== ""
-  readonly property bool showingDetail: root.settingsOpen || root.showingResult
   property int cardHeight: {
     var compact = contentMargin * 2 + headerHeight + Style.font.caption + Style.spacing.sm
-    if (!root.showingDetail)
+    if (!root.showingResult)
       return Math.min(compact, panel.height - Style.gapsOut * 2)
     return Math.min(Style.space(520), panel.height - Style.gapsOut * 2)
   }
   readonly property string hint: root.agentName
-    ? ("Enter to ask · Ctrl+N new · Esc to close · " + root.agentName + " · "
-      + (root.configuredModel || "agent default"))
-    : "Enter to ask · Ctrl+N new · Esc to close · default Omarchy agent"
+    ? ("Enter to ask · Ctrl+N new · Esc to close · " + root.agentName + " default settings")
+    : root.agentStatus
+
+  function boundedText(value, maximum) {
+    var text = String(value || "")
+    if (text.length <= maximum)
+      return text
+    var suffix = "\n\n[Output truncated by Quick Ask]"
+    return text.slice(0, Math.max(0, maximum - suffix.length)) + suffix
+  }
+
+  function cleanPlainText(value, maximum) {
+    return root.boundedText(String(value || "")
+      .replace(/\x1B(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, "")
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+      .trim(), maximum)
+  }
+
+  function sanitizeMarkdown(value) {
+    var text = root.cleanPlainText(value, root.maxAssistantCharacters)
+    // Qt Markdown can render embedded HTML and images. Quick Ask intentionally
+    // supports only text formatting and links, whose activation is gated below.
+    text = text.replace(/&/g, "&amp;")
+    text = text.replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    text = text.replace(/!\[/g, "&#33;[")
+    return text
+  }
 
   function open(payloadJson) {
     root.opened = true
-    root.settingsOpen = false
-    if (!agentProc.running)
-      agentProc.running = true
+    root.refreshAgent()
     Qt.callLater(function() {
       if (queryField)
         queryField.forceActiveFocus()
@@ -74,11 +103,20 @@ Item {
   }
 
   function close() {
+    if (root.busy) {
+      root.discardAskResult = true
+      root.cancelAsk("Request cancelled when Quick Ask closed.")
+    }
+    root.pendingExternalUrl = ""
+    root.pendingExternalHost = ""
+    root.pendingRequest = ""
+    root.messages = []
+    root.errorText = ""
     root.opened = false
   }
 
   function dismiss() {
-    root.opened = false
+    root.close()
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "damianpoole.ask")
   }
@@ -88,10 +126,6 @@ Item {
       root.dismiss()
     else
       root.open("{}")
-  }
-
-  function cleanText(text) {
-    return String(text || "").replace(/\x1B\[[0-9;]*[A-Za-z]/g, "").trim()
   }
 
   function scrollToLatest() {
@@ -104,7 +138,17 @@ Item {
   function appendMessage(role, content) {
     var next = root.messages.slice()
     next.push({ role: String(role), content: String(content) })
-    root.messages = next
+
+    var retained = []
+    var used = 0
+    for (var i = next.length - 1; i >= 0; i--) {
+      var size = String(next[i].content || "").length
+      if (retained.length > 0 && used + size > root.maxTranscriptCharacters)
+        break
+      retained.unshift(next[i])
+      used += size
+    }
+    root.messages = retained
     root.scrollToLatest()
   }
 
@@ -135,166 +179,186 @@ Item {
     if (root.busy)
       return
     root.messages = []
-    root.pendingQuery = ""
-    root.answer = ""
     root.errorText = ""
+    root.pendingExternalUrl = ""
+    root.pendingExternalHost = ""
     if (queryField)
       queryField.text = ""
     Qt.callLater(function() { if (queryField) queryField.forceActiveFocus() })
   }
 
-  function applySettings(text) {
+  function refreshAgent() {
+    if (agentProc.running)
+      return
+    root.agentStatus = "Detecting default agent…"
+    agentProc.running = true
+  }
+
+  function applyAgentRecord(data) {
     try {
-      var parsed = JSON.parse(String(text || "{}"))
-      root.configuredModel = String(parsed.model || "")
-      root.configuredReasoning = String(parsed.reasoning || "")
-      if (modelField)
-        modelField.text = root.configuredModel
-      root.settingsStatus = ""
+      var parsed = JSON.parse(String(data || "{}"))
+      if (parsed.ok && parsed.agent) {
+        root.agentName = root.cleanPlainText(parsed.agent, 32)
+        root.agentStatus = ""
+      } else {
+        root.agentName = ""
+        root.agentStatus = root.cleanPlainText(parsed.error, root.maxErrorCharacters)
+      }
     } catch (error) {
-      root.settingsStatus = "Could not read settings: " + error
+      root.agentName = ""
+      root.agentStatus = "Could not read the default-agent response."
     }
-  }
-
-  function loadSettings() {
-    if (!root.agentName || settingsLoadProc.running)
-      return
-    settingsLoadProc.command = ["bash", root.askScript, "--get-settings", root.agentName]
-    settingsLoadProc.running = true
-  }
-
-  function showSettings() {
-    root.settingsOpen = true
-    root.settingsStatus = ""
-    root.loadSettings()
-    Qt.callLater(function() { if (modelField) modelField.forceActiveFocus() })
-  }
-
-  function hideSettings() {
-    root.settingsOpen = false
-    root.settingsStatus = ""
-    Qt.callLater(function() { if (queryField) queryField.forceActiveFocus() })
-  }
-
-  function saveSettings(useAgentDefault) {
-    if (!root.agentName || settingsSaveProc.running)
-      return
-    var model = useAgentDefault ? "" : String(modelField.text || "").trim()
-    var reasoning = useAgentDefault ? "" : root.configuredReasoning
-    root.settingsBusy = true
-    root.settingsStatus = "Saving…"
-    settingsSaveProc.command = [
-      "bash", root.askScript, "--set-settings",
-      root.agentName, model, reasoning
-    ]
-    settingsSaveProc.running = true
   }
 
   function submit() {
     var userMessage = (queryField ? queryField.text : "").trim()
-    if (!userMessage || root.busy)
+    if (!userMessage || root.busy || askProc.running)
       return
 
     var prompt = root.buildAgentPrompt(userMessage)
-    root.pendingQuery = userMessage
-    root.answer = ""
+    root.pendingRequest = JSON.stringify({ prompt: prompt })
+    prompt = ""
     root.errorText = ""
+    root.processErrorBuffer = ""
+    root.pendingExternalUrl = ""
+    root.pendingExternalHost = ""
+    root.receivedAskRecord = false
+    root.discardAskResult = false
     root.busy = true
     queryField.text = ""
     root.appendMessage("user", userMessage)
-    root.askSeq += 1
-    var seq = root.askSeq
-
-    askProc.workingDirectory = root.workDir
-    askProc.command = ["bash", root.askScript, prompt]
-    if (askProc.running)
-      askProc.running = false
-
-    Qt.callLater(function() {
-      if (seq !== root.askSeq)
-        return
-      askProc.running = true
-    })
+    userMessage = ""
+    askProc.running = true
+    askWatchdog.restart()
   }
 
-  function applyFinished(exitCode, stdoutText, stderrText) {
-    root.busy = false
-    var fromOut = root.cleanText(stdoutText)
-    var fromErr = root.cleanText(stderrText)
-    if (exitCode === 0 && fromOut) {
-      root.answer = fromOut
-      root.errorText = ""
-      root.appendMessage("assistant", fromOut)
-      root.pendingQuery = ""
-      Qt.callLater(function() { if (queryField) queryField.forceActiveFocus() })
+  function applyAskRecord(data) {
+    if (String(data || "").length > root.maxProtocolCharacters) {
+      root.cancelAsk("Agent response exceeded the Quick Ask protocol limit.")
       return
     }
-    root.answer = fromOut
-    root.errorText = fromErr || ("Agent exited " + exitCode)
-    root.pendingQuery = ""
-    root.scrollToLatest()
+    if (root.discardAskResult) {
+      root.receivedAskRecord = true
+      root.discardAskResult = false
+      root.busy = false
+      askWatchdog.stop()
+      forceKill.stop()
+      return
+    }
+    try {
+      var parsed = JSON.parse(String(data || "{}"))
+      root.receivedAskRecord = true
+      root.busy = false
+      askWatchdog.stop()
+      forceKill.stop()
+      if (parsed.ok && parsed.answer) {
+        root.agentName = root.cleanPlainText(parsed.agent, 32)
+        root.errorText = ""
+        root.appendMessage("assistant", root.sanitizeMarkdown(parsed.answer))
+        Qt.callLater(function() { if (queryField) queryField.forceActiveFocus() })
+      } else {
+        root.errorText = root.cleanPlainText(parsed.error, root.maxErrorCharacters)
+          || "The agent request failed."
+        root.scrollToLatest()
+      }
+    } catch (error) {
+      root.receivedAskRecord = true
+      root.busy = false
+      root.errorText = "Could not read the bounded agent response."
+      root.scrollToLatest()
+    }
+  }
+
+  function appendProcessError(data) {
+    if (root.processErrorBuffer.length >= root.maxErrorCharacters)
+      return
+    root.processErrorBuffer = root.cleanPlainText(
+      root.processErrorBuffer + String(data || ""), root.maxErrorCharacters)
+  }
+
+  function cancelAsk(message) {
+    if (!root.busy)
+      return
+    root.errorText = root.cleanPlainText(message, root.maxErrorCharacters)
+    if (askProc.running) {
+      askProc.signal(15)
+      forceKill.restart()
+    } else {
+      root.busy = false
+    }
+  }
+
+  function latestAnswer() {
+    for (var i = root.messages.length - 1; i >= 0; i--) {
+      if (root.messages[i].role === "assistant")
+        return String(root.messages[i].content || "")
+    }
+    return ""
   }
 
   function copyAnswer() {
-    var text = root.answer
-    if (!text)
+    var answer = root.latestAnswer()
+    if (answer)
+      Quickshell.clipboardText = answer
+  }
+
+  function requestOpenLink(link) {
+    var candidate = String(link || "")
+    if (!candidate || candidate.length > root.maxLinkCharacters
+        || /[\u0000-\u0020\u007F]/.test(candidate)) {
+      root.errorText = "Blocked an invalid or overlong external link."
       return
-    Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
+    }
+    var match = candidate.match(/^(https?):\/\/([^\/?#]+)(?:[\/?#].*)?$/i)
+    if (!match || match[2].indexOf("@") >= 0) {
+      root.errorText = "Quick Ask only opens credential-free HTTP(S) links."
+      return
+    }
+    var authority = match[2]
+    var validAuthority = /^\[[0-9a-f:.]+\](?::[0-9]{1,5})?$/i.test(authority)
+      || /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?$/i.test(authority)
+    if (!validAuthority || authority.indexOf("..") >= 0) {
+      root.errorText = "Blocked a malformed external link authority."
+      return
+    }
+    var port = authority.match(/:(\d+)$/)
+    if (port && Number(port[1]) > 65535) {
+      root.errorText = "Blocked an external link with an invalid port."
+      return
+    }
+    root.pendingExternalUrl = candidate
+    root.pendingExternalHost = authority
+    root.scrollToLatest()
+  }
+
+  function confirmOpenLink() {
+    var candidate = root.pendingExternalUrl
+    root.pendingExternalUrl = ""
+    root.pendingExternalHost = ""
+    if (candidate)
+      Qt.openUrlExternally(candidate)
   }
 
   Process {
     id: agentProc
     running: false
-    command: ["omarchy-default-agent"]
+    command: ["python3", root.helperScript, "detect"]
     stdinEnabled: false
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.agentName = String(text || "").trim()
-        root.loadSettings()
-      }
-    }
-  }
 
-  Process {
-    id: settingsLoadProc
-    running: false
-    command: []
-    stdinEnabled: false
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applySettings(text)
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var message = root.cleanText(text)
-        if (message) root.settingsStatus = message
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function(data) {
+        if (String(data || "").length <= root.maxErrorCharacters)
+          root.applyAgentRecord(data)
+        else
+          root.agentStatus = "Default-agent response exceeded its limit."
       }
     }
-  }
-
-  Process {
-    id: settingsSaveProc
-    running: false
-    command: []
-    stdinEnabled: false
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.applySettings(text)
-        root.settingsBusy = false
-        root.settingsStatus = "Saved for " + root.agentName
-      }
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var message = root.cleanText(text)
-        if (message) {
-          root.settingsBusy = false
-          root.settingsStatus = message
-        }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(data) {
+        if (!root.agentName)
+          root.agentStatus = root.cleanPlainText(data, root.maxErrorCharacters)
       }
     }
   }
@@ -302,33 +366,67 @@ Item {
   Process {
     id: askProc
     running: false
-    command: []
-    stdinEnabled: false
+    command: ["python3", root.helperScript, "ask"]
+    workingDirectory: root.workDir
+    stdinEnabled: true
 
-    stdout: StdioCollector {
-      id: askStdout
-      waitForEnd: true
-      onStreamFinished: root.applyFinished(root.lastExitCode, text, askStderr.text)
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function(data) { root.applyAskRecord(data) }
     }
-    stderr: StdioCollector {
-      id: askStderr
-      waitForEnd: true
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(data) { root.appendProcessError(data) }
     }
 
-    onExited: function(exitCode, exitStatus) {
+    onStarted: {
+      var request = root.pendingRequest
+      root.pendingRequest = ""
+      askProc.write(request + "\n")
+      request = ""
+    }
+
+    onExited: function(exitCode) {
       root.lastExitCode = exitCode
+      askWatchdog.stop()
+      forceKill.stop()
       finishFallback.restart()
     }
   }
 
   Timer {
-    id: finishFallback
-    interval: 400
+    id: askWatchdog
+    interval: 125000
+    repeat: false
+    onTriggered: root.cancelAsk("Agent exceeded the Quick Ask deadline.")
+  }
+
+  Timer {
+    id: forceKill
+    interval: 2500
     repeat: false
     onTriggered: {
-      if (!root.busy)
+      if (askProc.running)
+        askProc.signal(9)
+    }
+  }
+
+  Timer {
+    id: finishFallback
+    interval: 250
+    repeat: false
+    onTriggered: {
+      if (!root.busy || root.receivedAskRecord)
         return
-      root.applyFinished(root.lastExitCode, askStdout.text, askStderr.text)
+      root.busy = false
+      if (root.discardAskResult) {
+        root.discardAskResult = false
+        root.processErrorBuffer = ""
+        return
+      }
+      root.errorText = root.processErrorBuffer
+        || (root.lastExitCode === 0 ? "Agent returned no response." : "Agent bridge exited " + root.lastExitCode + ".")
+      root.scrollToLatest()
     }
   }
 
@@ -365,12 +463,7 @@ Item {
 
       MouseArea {
         anchors.fill: parent
-        onClicked: {
-          if (root.settingsOpen && modelField)
-            modelField.forceActiveFocus()
-          else if (queryField)
-            queryField.forceActiveFocus()
-        }
+        onClicked: if (queryField) queryField.forceActiveFocus()
       }
 
       ColumnLayout {
@@ -392,7 +485,7 @@ Item {
             id: queryField
             Layout.fillWidth: true
             Layout.fillHeight: true
-            visible: !root.settingsOpen
+            maximumLength: root.maxUserCharacters
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
             foreground: root.foreground
@@ -405,14 +498,12 @@ Item {
               if (event.key === Qt.Key_Escape) {
                 root.dismiss()
                 event.accepted = true
-              } else if (event.key === Qt.Key_Comma && (event.modifiers & Qt.ControlModifier)) {
-                root.showSettings()
-                event.accepted = true
               } else if (event.key === Qt.Key_N && (event.modifiers & Qt.ControlModifier)) {
                 root.startNewConversation()
                 event.accepted = true
-              } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier)) {
-                if (!queryField.selectedText && root.answer) {
+              } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier)
+                         && !(event.modifiers & Qt.ShiftModifier)) {
+                if (!queryField.selectedText && root.latestAnswer()) {
                   root.copyAnswer()
                   event.accepted = true
                 }
@@ -420,18 +511,7 @@ Item {
             }
           }
 
-          Text {
-            Layout.fillWidth: true
-            visible: root.settingsOpen
-            text: "Quick Ask settings"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.heading
-            verticalAlignment: Text.AlignVCenter
-          }
-
           Button {
-            visible: !root.settingsOpen
             Layout.preferredHeight: root.headerHeight
             text: "New"
             foreground: root.foreground
@@ -440,159 +520,25 @@ Item {
             enabled: !root.busy && root.messages.length > 0
             onClicked: root.startNewConversation()
           }
-
-          Button {
-            Layout.preferredHeight: root.headerHeight
-            text: root.settingsOpen ? "Back" : "Settings"
-            foreground: root.foreground
-            bordered: true
-            focusable: true
-            onClicked: root.settingsOpen ? root.hideSettings() : root.showSettings()
-          }
-        }
-
-        ColumnLayout {
-          Layout.fillWidth: true
-          Layout.fillHeight: true
-          visible: root.settingsOpen
-          spacing: Style.spacing.md
-
-          Text {
-            Layout.fillWidth: true
-            text: root.agentName ? ("Default Omarchy agent: " + root.agentName) : "Detecting default agent…"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-          }
-
-          Text {
-            Layout.fillWidth: true
-            text: "Model"
-            color: root.foreground
-            opacity: 0.72
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          TextField {
-            id: modelField
-            Layout.fillWidth: true
-            foreground: root.foreground
-            placeholderText: "Agent default (leave blank)"
-            Keys.onPressed: function(event) {
-              if (event.key === Qt.Key_Escape) {
-                root.hideSettings()
-                event.accepted = true
-              }
-            }
-          }
-
-          Text {
-            Layout.fillWidth: true
-            text: "Leave blank to inherit the agent's own configured model. Custom model IDs are passed directly to the agent CLI."
-            wrapMode: Text.Wrap
-            color: root.foreground
-            opacity: 0.5
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Button {
-            visible: root.agentName === "codex"
-            text: "Use Luna / low"
-            foreground: root.foreground
-            bordered: true
-            onClicked: {
-              modelField.text = "gpt-5.6-luna"
-              root.configuredReasoning = "low"
-            }
-          }
-
-          Text {
-            Layout.fillWidth: true
-            visible: root.agentName === "codex"
-            text: "Reasoning"
-            color: root.foreground
-            opacity: 0.72
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          RowLayout {
-            Layout.fillWidth: true
-            visible: root.agentName === "codex"
-            spacing: Style.spacing.xs
-
-            Repeater {
-              model: [
-                { label: "Default", value: "" },
-                { label: "Minimal", value: "minimal" },
-                { label: "Low", value: "low" },
-                { label: "Medium", value: "medium" },
-                { label: "High", value: "high" }
-              ]
-
-              Button {
-                required property var modelData
-                text: modelData.label
-                foreground: root.foreground
-                bordered: true
-                selected: root.configuredReasoning === modelData.value
-                onClicked: root.configuredReasoning = modelData.value
-              }
-            }
-          }
-
-          Text {
-            Layout.fillWidth: true
-            visible: root.settingsStatus !== ""
-            text: root.settingsStatus
-            color: root.settingsStatus.indexOf("Saved") === 0 ? root.foreground : Color.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Item { Layout.fillHeight: true }
-
-          RowLayout {
-            Layout.fillWidth: true
-            spacing: Style.spacing.sm
-
-            Button {
-              text: "Use agent default"
-              foreground: root.foreground
-              bordered: true
-              enabled: !root.settingsBusy && root.agentName !== ""
-              onClicked: root.saveSettings(true)
-            }
-
-            Item { Layout.fillWidth: true }
-
-            Button {
-              text: root.settingsBusy ? "Saving…" : "Save"
-              foreground: root.foreground
-              bordered: true
-              enabled: !root.settingsBusy && root.agentName !== ""
-              onClicked: root.saveSettings(false)
-            }
-          }
         }
 
         Text {
           Layout.fillWidth: true
-          visible: !root.settingsOpen && !root.showingResult
+          visible: !root.showingResult
+          textFormat: Text.PlainText
           text: root.hint
           color: root.foreground
           opacity: 0.5
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
         }
 
         Flickable {
           id: answerScroll
           Layout.fillWidth: true
           Layout.fillHeight: true
-          visible: !root.settingsOpen && root.showingResult
+          visible: root.showingResult
           clip: true
           contentWidth: width
           contentHeight: answerColumn.implicitHeight
@@ -608,6 +554,7 @@ Item {
               model: root.messages
 
               Item {
+                id: messageItem
                 required property var modelData
                 width: answerColumn.width
                 height: messageBubble.height
@@ -617,26 +564,26 @@ Item {
                   width: Math.round(parent.width * 0.78)
                   height: messageText.implicitHeight + Style.spacing.controlPaddingY * 2
                   radius: root.cornerRadius
-                  color: modelData.role === "user"
+                  color: messageItem.modelData.role === "user"
                     ? Style.selectedFillFor(root.foreground, Color.accent)
                     : Style.hoverFillFor(root.foreground, Color.accent)
-                  anchors.right: modelData.role === "user" ? parent.right : undefined
-                  anchors.left: modelData.role === "user" ? undefined : parent.left
+                  anchors.right: messageItem.modelData.role === "user" ? parent.right : undefined
+                  anchors.left: messageItem.modelData.role === "user" ? undefined : parent.left
 
                   Text {
                     id: messageText
                     width: parent.width - Style.spacing.controlPaddingX * 2
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.verticalCenter: parent.verticalCenter
-                    text: modelData.content
-                    textFormat: modelData.role === "assistant" ? Text.MarkdownText : Text.PlainText
+                    text: messageItem.modelData.content
+                    textFormat: messageItem.modelData.role === "assistant" ? Text.MarkdownText : Text.PlainText
                     wrapMode: Text.Wrap
                     color: root.foreground
                     linkColor: Color.accent
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
-                    horizontalAlignment: modelData.role === "user" ? Text.AlignRight : Text.AlignLeft
-                    onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                    horizontalAlignment: messageItem.modelData.role === "user" ? Text.AlignRight : Text.AlignLeft
+                    onLinkActivated: function(link) { root.requestOpenLink(link) }
                   }
                 }
               }
@@ -653,6 +600,7 @@ Item {
                 id: askingText
                 width: parent.width - Style.spacing.controlPaddingX * 2
                 anchors.centerIn: parent
+                textFormat: Text.PlainText
                 text: root.agentName ? ("Asking " + root.agentName + "…") : "Asking…"
                 color: root.foreground
                 opacity: 0.72
@@ -664,6 +612,7 @@ Item {
             Text {
               width: parent.width
               visible: root.errorText !== ""
+              textFormat: Text.PlainText
               text: root.errorText
               wrapMode: Text.Wrap
               color: Color.urgent
@@ -671,9 +620,56 @@ Item {
               font.pixelSize: Style.font.body
             }
 
+            BorderSurface {
+              width: parent.width
+              visible: root.pendingExternalUrl !== ""
+              implicitHeight: linkPrompt.implicitHeight + Style.spacing.controlPaddingY * 2
+              radius: root.cornerRadius
+              color: Style.hoverFillFor(root.foreground, Color.accent)
+              borderSpec: Border.flat(root.border, 1)
+
+              ColumnLayout {
+                id: linkPrompt
+                width: parent.width - Style.spacing.controlPaddingX * 2
+                anchors.centerIn: parent
+                spacing: Style.spacing.sm
+
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  text: "Open this external HTTP(S) destination?\n" + root.pendingExternalHost
+                    + "\n" + root.pendingExternalUrl
+                  wrapMode: Text.WrapAnywhere
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                RowLayout {
+                  Layout.alignment: Qt.AlignRight
+                  Button {
+                    text: "Cancel"
+                    foreground: root.foreground
+                    bordered: true
+                    onClicked: {
+                      root.pendingExternalUrl = ""
+                      root.pendingExternalHost = ""
+                    }
+                  }
+                  Button {
+                    text: "Open"
+                    foreground: root.foreground
+                    bordered: true
+                    onClicked: root.confirmOpenLink()
+                  }
+                }
+              }
+            }
+
             Text {
               width: parent.width
               visible: root.messages.length > 0 && !root.busy && root.errorText === ""
+              textFormat: Text.PlainText
               text: "Reply above · Ctrl+N starts a new conversation · Ctrl+C copies the latest answer"
               color: root.foreground
               opacity: 0.5
@@ -684,5 +680,12 @@ Item {
         }
       }
     }
+  }
+
+  Component.onDestruction: {
+    if (askProc.running)
+      askProc.signal(15)
+    root.pendingRequest = ""
+    root.messages = []
   }
 }

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "damianpoole.ask",
   "name": "Ask",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "author": "Damian Poole",
   "license": "MIT",
-  "description": "Raycast-style conversational overlay for quick Markdown answers from your configurable Omarchy default agent.",
+  "description": "Private, bounded conversational overlay for quick Markdown answers from a supported Omarchy default agent.",
   "kinds": [
     "overlay"
   ],
