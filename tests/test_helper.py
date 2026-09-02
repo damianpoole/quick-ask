@@ -44,9 +44,14 @@ class HelperIntegrationTests(unittest.TestCase):
             f"#!/usr/bin/env python3\nprint({agent!r})\n",
         )
 
-    def run_helper(self, action: str, request: bytes = b"") -> subprocess.CompletedProcess[bytes]:
+    def run_helper(
+        self,
+        action: str,
+        request: bytes = b"",
+        *extra_arguments: str,
+    ) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
-            [sys.executable, str(HELPER_PATH), action],
+            [sys.executable, str(HELPER_PATH), action, *extra_arguments],
             input=request,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -62,7 +67,7 @@ class HelperIntegrationTests(unittest.TestCase):
     def test_detect_returns_only_supported_canonical_agent(self) -> None:
         self.select_agent("codex")
         result = self.run_helper("detect")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.record(result), {"ok": True, "agent": "codex"})
 
     def test_codex_receives_prompt_on_stdin_and_not_in_proc_cmdline(self) -> None:
@@ -70,23 +75,24 @@ class HelperIntegrationTests(unittest.TestCase):
         pid_file = self.root / "agent.pid"
         argv_file = self.root / "agent.argv"
         stdin_file = self.root / "agent.stdin"
-        self.environment.update(
-            MOCK_PID_FILE=str(pid_file),
-            MOCK_ARGV_FILE=str(argv_file),
-            MOCK_STDIN_FILE=str(stdin_file),
-        )
+        environment_file = self.root / "agent.env"
+        cwd_file = self.root / "agent.cwd"
+        self.environment["UNRELATED_SECRET"] = "MUST_NOT_REACH_AGENT"
+        self.environment["OPENAI_API_KEY"] = "REQUIRED_OPENAI_CREDENTIAL"
         self.write_executable(
             "codex",
-            """#!/usr/bin/env python3
+            f"""#!/usr/bin/env python3
 import os
 from pathlib import Path
 import sys
 import time
 
-Path(os.environ["MOCK_PID_FILE"]).write_text(str(os.getpid()), encoding="utf-8")
-Path(os.environ["MOCK_ARGV_FILE"]).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")
+Path({str(argv_file)!r}).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+Path({str(environment_file)!r}).write_text("\\n".join(sorted(os.environ)), encoding="utf-8")
+Path({str(cwd_file)!r}).write_text(os.getcwd(), encoding="utf-8")
 prompt = sys.stdin.read()
-Path(os.environ["MOCK_STDIN_FILE"]).write_text(prompt, encoding="utf-8")
+Path({str(stdin_file)!r}).write_text(prompt, encoding="utf-8")
 time.sleep(0.75)
 output_path = sys.argv[sys.argv.index("--output-last-message") + 1]
 with open(output_path, "w", encoding="utf-8") as output:
@@ -124,24 +130,126 @@ with open(output_path, "w", encoding="utf-8") as output:
         self.assertNotIn(secret, codex_arguments)
         self.assertIn("--ephemeral", codex_arguments)
         self.assertIn("read-only", codex_arguments)
+        self.assertIn("--ignore-user-config", codex_arguments)
+        self.assertIn("--ignore-rules", codex_arguments)
+        agent_environment = environment_file.read_text("utf-8").splitlines()
+        self.assertIn("OPENAI_API_KEY", agent_environment)
+        self.assertNotIn("UNRELATED_SECRET", agent_environment)
+        self.assertRegex(cwd_file.read_text("utf-8"), r"/quick-ask-agent-[^/]+$")
         output_index = codex_arguments.index("--output-last-message") + 1
         self.assertRegex(codex_arguments[output_index], r"^/proc/self/fd/\d+$")
 
-    def test_claude_receives_prompt_on_stdin_without_prompt_argument(self) -> None:
-        self.select_agent("claude")
-        argv_file = self.root / "claude.argv"
-        stdin_file = self.root / "claude.stdin"
-        self.environment.update(MOCK_ARGV_FILE=str(argv_file), MOCK_STDIN_FILE=str(stdin_file))
+    def test_codex_full_configuration_requires_explicit_opt_in(self) -> None:
+        self.select_agent("codex")
+        argv_file = self.root / "agent.argv"
         self.write_executable(
-            "claude",
+            "codex",
+            f"""#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+Path({str(argv_file)!r}).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+sys.stdin.read()
+output_path = sys.argv[sys.argv.index("--output-last-message") + 1]
+Path(output_path).write_text("ANSWER", encoding="utf-8")
+""",
+        )
+        result = self.run_helper(
+            "ask",
+            b'{"prompt":"hello"}\n',
+            "--inherit-agent-config",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = argv_file.read_text("utf-8").splitlines()
+        self.assertNotIn("--ignore-user-config", arguments)
+        self.assertNotIn("--ignore-rules", arguments)
+        self.assertIn("read-only", arguments)
+
+    def test_codex_multicall_shim_keeps_its_invocation_name(self) -> None:
+        self.select_agent("codex")
+        launcher = self.write_executable(
+            "mise",
             """#!/usr/bin/env python3
 import os
 from pathlib import Path
 import sys
 
-Path(os.environ["MOCK_ARGV_FILE"]).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+if os.path.basename(sys.argv[0]) != "codex":
+    print("error: unexpected argument '--ignore-user-config' found", file=sys.stderr)
+    raise SystemExit(2)
+sys.stdin.read()
+output_path = sys.argv[sys.argv.index("--output-last-message") + 1]
+Path(output_path).write_text("SHIM_ANSWER", encoding="utf-8")
+""",
+        )
+        (self.bin_dir / "codex").symlink_to(launcher)
+
+        result = self.run_helper("ask", b'{"prompt":"hello"}\n')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.record(result)["answer"], "SHIM_ANSWER")
+
+    def test_codex_internal_files_are_not_subject_to_the_answer_limit(self) -> None:
+        self.select_agent("codex")
+        internal_file = self.root / "codex-internal.db"
+        self.write_executable(
+            "codex",
+            f"""#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+Path({str(internal_file)!r}).write_bytes(b"x" * ({HELPER.MAX_ANSWER_BYTES} + 1))
+sys.stdin.read()
+output_path = sys.argv[sys.argv.index("--output-last-message") + 1]
+Path(output_path).write_text("SMALL_ANSWER", encoding="utf-8")
+""",
+        )
+
+        result = self.run_helper("ask", b'{"prompt":"hello"}\n')
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.record(result)["answer"], "SMALL_ANSWER")
+        self.assertGreater(internal_file.stat().st_size, HELPER.MAX_ANSWER_BYTES)
+
+    def test_codex_answer_pipe_enforces_its_own_byte_limit(self) -> None:
+        self.select_agent("codex")
+        self.write_executable(
+            "codex",
+            f"""#!/usr/bin/env python3
+import os
+import sys
+
+sys.stdin.read()
+output_path = sys.argv[sys.argv.index("--output-last-message") + 1]
+output_fd = os.open(output_path, os.O_WRONLY)
+os.write(output_fd, b"x" * ({HELPER.MAX_ANSWER_BYTES} + 1))
+os.close(output_fd)
+""",
+        )
+
+        result = self.run_helper("ask", b'{"prompt":"hello"}\n')
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("answer exceeded", str(self.record(result)["error"]))
+
+    def test_claude_receives_prompt_on_stdin_without_prompt_argument(self) -> None:
+        self.select_agent("claude")
+        argv_file = self.root / "claude.argv"
+        stdin_file = self.root / "claude.stdin"
+        environment_file = self.root / "claude.env"
+        self.environment["UNRELATED_SECRET"] = "MUST_NOT_REACH_AGENT"
+        self.environment["ANTHROPIC_API_KEY"] = "REQUIRED_ANTHROPIC_CREDENTIAL"
+        self.write_executable(
+            "claude",
+            f"""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+Path({str(argv_file)!r}).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+Path({str(environment_file)!r}).write_text("\\n".join(sorted(os.environ)), encoding="utf-8")
 prompt = sys.stdin.read()
-Path(os.environ["MOCK_STDIN_FILE"]).write_text(prompt, encoding="utf-8")
+Path({str(stdin_file)!r}).write_text(prompt, encoding="utf-8")
 print("CLAUDE_ANSWER")
 """,
         )
@@ -153,6 +261,38 @@ print("CLAUDE_ANSWER")
         claude_arguments = argv_file.read_text("utf-8").splitlines()
         self.assertNotIn(secret, claude_arguments)
         self.assertIn("plan", claude_arguments)
+        self.assertIn("--restricted", claude_arguments)
+        self.assertIn("--no-session-persistence", claude_arguments)
+        self.assertIn("mcp__*", claude_arguments)
+        agent_environment = environment_file.read_text("utf-8").splitlines()
+        self.assertIn("ANTHROPIC_API_KEY", agent_environment)
+        self.assertNotIn("UNRELATED_SECRET", agent_environment)
+
+    def test_claude_full_configuration_requires_explicit_opt_in(self) -> None:
+        self.select_agent("claude")
+        argv_file = self.root / "claude.argv"
+        self.write_executable(
+            "claude",
+            f"""#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+Path({str(argv_file)!r}).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+sys.stdin.read()
+print("ANSWER")
+""",
+        )
+        result = self.run_helper(
+            "ask",
+            b'{"prompt":"hello"}\n',
+            "--inherit-agent-config",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = argv_file.read_text("utf-8").splitlines()
+        self.assertNotIn("--restricted", arguments)
+        self.assertNotIn("mcp__*", arguments)
+        self.assertIn("plan", arguments)
+        self.assertIn("--no-session-persistence", arguments)
 
     def test_unsupported_agent_fails_closed(self) -> None:
         self.select_agent("gemini")

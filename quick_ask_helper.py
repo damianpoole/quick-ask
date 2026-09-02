@@ -14,9 +14,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import BinaryIO, Callable, Sequence
 
 
 MAX_REQUEST_BYTES = 256 * 1024
@@ -31,6 +32,43 @@ DETECT_TIMEOUT_SECONDS = 2.0
 TERM_GRACE_SECONDS = 1.5
 KILL_GRACE_SECONDS = 1.0
 SUPPORTED_AGENTS = frozenset({"codex", "claude"})
+
+COMMON_ENVIRONMENT_KEYS = frozenset(
+    {
+        "ALL_PROXY",
+        "all_proxy",
+        "HOME",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "LANG",
+        "LOGNAME",
+        "NO_PROXY",
+        "no_proxy",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TERM",
+        "TMPDIR",
+        "USER",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    }
+)
+AGENT_ENVIRONMENT_KEYS = {
+    "codex": frozenset({"CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL"}),
+    "claude": frozenset(
+        {
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CONFIG_DIR",
+        }
+    ),
+}
 
 _ANSI_ESCAPE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _AGENT_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
@@ -55,6 +93,7 @@ class ProcessResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+    captured: bytes = b""
 
 
 def _enable_subreaper() -> None:
@@ -66,7 +105,7 @@ def _enable_subreaper() -> None:
         raise BridgeError("Linux child-subreaper support is required for safe cleanup.") from error
 
 
-def _child_setup(file_size_limit: int | None) -> Callable[[], None]:
+def _child_setup() -> Callable[[], None]:
     expected_parent = os.getpid()
 
     def setup() -> None:
@@ -76,8 +115,6 @@ def _child_setup(file_size_limit: int | None) -> Callable[[], None]:
         if os.getppid() != expected_parent:
             os.kill(os.getpid(), signal.SIGKILL)
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        if file_size_limit is not None:
-            resource.setrlimit(resource.RLIMIT_FSIZE, (file_size_limit, file_size_limit))
 
     return setup
 
@@ -155,7 +192,10 @@ def run_bounded(
     stdout_limit: int,
     stderr_limit: int,
     pass_fds: Sequence[int] = (),
-    file_size_limit: int | None = None,
+    environment: dict[str, str] | None = None,
+    working_directory: str | None = None,
+    captured_output: tuple[BinaryIO, int, str] | None = None,
+    close_after_spawn: Sequence[int] = (),
 ) -> ProcessResult:
     global _active_process
     if _cancel_requested:
@@ -169,12 +209,17 @@ def run_bounded(
         stderr=subprocess.PIPE,
         start_new_session=True,
         pass_fds=tuple(pass_fds),
-        preexec_fn=_child_setup(file_size_limit),
+        preexec_fn=_child_setup(),
+        env=environment,
+        cwd=working_directory,
     )
+    for file_descriptor in close_after_spawn:
+        os.close(file_descriptor)
     _active_process = process
 
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
+    captured_buffer = bytearray()
     parser = selectors.DefaultSelector()
     root_exit_cleaned = False
     input_view = memoryview(stdin_data)
@@ -192,6 +237,10 @@ def run_bounded(
             process.stdin.close()
         parser.register(process.stdout, selectors.EVENT_READ, ("output", stdout_buffer, stdout_limit, "stdout"))
         parser.register(process.stderr, selectors.EVENT_READ, ("output", stderr_buffer, stderr_limit, "stderr"))
+        if captured_output is not None:
+            stream, limit, stream_name = captured_output
+            os.set_blocking(stream.fileno(), False)
+            parser.register(stream, selectors.EVENT_READ, ("output", captured_buffer, limit, stream_name))
 
         while parser.get_map():
             if _cancel_requested:
@@ -245,13 +294,19 @@ def run_bounded(
             raise ProcessDeadline(f"Agent exceeded the {int(timeout_seconds)}-second deadline.") from error
         _signal_process_group(process, signal.SIGKILL)
         _cleanup_adopted_children(time.monotonic() + KILL_GRACE_SECONDS)
-        return ProcessResult(returncode, bytes(stdout_buffer), bytes(stderr_buffer))
+        return ProcessResult(
+            returncode,
+            bytes(stdout_buffer),
+            bytes(stderr_buffer),
+            bytes(captured_buffer),
+        )
     except BaseException:
         _terminate_process_tree(process)
         raise
     finally:
         parser.close()
-        for stream in (process.stdin, process.stdout, process.stderr):
+        extra_stream = captured_output[0] if captured_output is not None else None
+        for stream in (process.stdin, process.stdout, process.stderr, extra_stream):
             if stream is not None and not stream.closed:
                 stream.close()
         _active_process = None
@@ -263,24 +318,26 @@ def _clean_text(data: bytes, limit: int) -> str:
     return "".join(character for character in text if character in "\n\t" or ord(character) >= 0x20).strip()
 
 
-def _read_fd_bounded(file_descriptor: int, limit: int) -> bytes:
-    chunks: list[bytes] = []
-    used = 0
-    while True:
-        chunk = os.read(file_descriptor, min(8192, limit + 1 - used))
-        if not chunk:
-            return b"".join(chunks)
-        chunks.append(chunk)
-        used += len(chunk)
-        if used > limit:
-            raise OutputOverflow(f"Agent answer exceeded the {limit}-byte limit.")
-
-
 def _find_executable(name: str) -> str:
     executable = shutil.which(name)
     if executable is None:
         raise BridgeError(f"The configured {name} CLI is not installed.")
-    return executable
+    # Preserve the discovered basename for multi-call launchers such as mise.
+    # Resolving a `codex -> mise` shim to its real target changes argv[0], which
+    # makes mise consume Codex's flags itself instead of dispatching to Codex.
+    return os.path.abspath(executable)
+
+
+def _agent_environment(agent: str | None = None) -> dict[str, str]:
+    """Return only environment values required to locate and authenticate a CLI."""
+
+    allowed = set(COMMON_ENVIRONMENT_KEYS)
+    allowed.update(key for key in os.environ if key == "LC_ALL" or key.startswith("LC_"))
+    if agent is not None:
+        allowed.update(AGENT_ENVIRONMENT_KEYS.get(agent, ()))
+    environment = {key: os.environ[key] for key in allowed if key in os.environ}
+    environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return environment
 
 
 def detect_agent() -> str:
@@ -290,6 +347,7 @@ def detect_agent() -> str:
         timeout_seconds=DETECT_TIMEOUT_SECONDS,
         stdout_limit=MAX_DETECT_STDOUT_BYTES,
         stderr_limit=MAX_DETECT_STDERR_BYTES,
+        environment=_agent_environment(),
     )
     if result.returncode != 0:
         detail = _clean_text(result.stderr, MAX_DETECT_STDERR_BYTES)
@@ -328,10 +386,15 @@ def _read_request() -> bytearray:
     return prompt
 
 
-def _run_codex(prompt: bytearray, timeout_seconds: float) -> str:
-    if not hasattr(os, "memfd_create"):
-        raise BridgeError("This system does not support anonymous answer files required by Codex.")
-    answer_fd = os.memfd_create("quick-ask-answer", flags=os.MFD_CLOEXEC)
+def _run_codex(
+    prompt: bytearray,
+    timeout_seconds: float,
+    *,
+    inherit_agent_config: bool,
+    working_directory: str,
+) -> str:
+    answer_read_fd, answer_write_fd = os.pipe2(os.O_CLOEXEC)
+    answer_stream = os.fdopen(answer_read_fd, "rb", buffering=0)
     try:
         command = [
             _find_executable("codex"),
@@ -343,47 +406,73 @@ def _run_codex(prompt: bytearray, timeout_seconds: float) -> str:
             "--color",
             "never",
             "--output-last-message",
-            f"/proc/self/fd/{answer_fd}",
+            f"/proc/self/fd/{answer_write_fd}",
             "-",
         ]
+        if not inherit_agent_config:
+            command[2:2] = ["--ignore-user-config", "--ignore-rules"]
         result = run_bounded(
             command,
             stdin_data=prompt,
             timeout_seconds=timeout_seconds,
             stdout_limit=MAX_AGENT_STDOUT_BYTES,
             stderr_limit=MAX_AGENT_STDERR_BYTES,
-            pass_fds=(answer_fd,),
-            file_size_limit=MAX_ANSWER_BYTES,
+            pass_fds=(answer_write_fd,),
+            environment=_agent_environment("codex"),
+            working_directory=working_directory,
+            captured_output=(answer_stream, MAX_ANSWER_BYTES, "answer"),
+            close_after_spawn=(answer_write_fd,),
         )
         if result.returncode != 0:
             detail = _clean_text(result.stderr, MAX_AGENT_STDERR_BYTES)
             raise BridgeError(detail or f"Codex exited with status {result.returncode}.")
-        size = os.fstat(answer_fd).st_size
-        if size <= 0:
+        answer = result.captured
+        if not answer:
             raise BridgeError("Codex returned no answer.")
-        if size > MAX_ANSWER_BYTES:
-            raise OutputOverflow(f"Codex answer exceeded the {MAX_ANSWER_BYTES}-byte limit.")
-        os.lseek(answer_fd, 0, os.SEEK_SET)
-        answer = _read_fd_bounded(answer_fd, MAX_ANSWER_BYTES)
         return _clean_text(answer, MAX_ANSWER_BYTES)
     finally:
-        os.close(answer_fd)
+        if not answer_stream.closed:
+            answer_stream.close()
+        try:
+            os.close(answer_write_fd)
+        except OSError:
+            pass
 
 
-def _run_claude(prompt: bytearray, timeout_seconds: float) -> str:
+def _run_claude(
+    prompt: bytearray,
+    timeout_seconds: float,
+    *,
+    inherit_agent_config: bool,
+    working_directory: str,
+) -> str:
+    command = [
+        _find_executable("claude"),
+        "-p",
+        "--output-format",
+        "text",
+        "--permission-mode",
+        "plan",
+        "--no-session-persistence",
+    ]
+    if not inherit_agent_config:
+        command.extend(
+            [
+                "--restricted",
+                "--tools",
+                "",
+                "--disallowedTools",
+                "mcp__*",
+            ]
+        )
     result = run_bounded(
-        [
-            _find_executable("claude"),
-            "-p",
-            "--output-format",
-            "text",
-            "--permission-mode",
-            "plan",
-        ],
+        command,
         stdin_data=prompt,
         timeout_seconds=timeout_seconds,
         stdout_limit=MAX_ANSWER_BYTES,
         stderr_limit=MAX_AGENT_STDERR_BYTES,
+        environment=_agent_environment("claude"),
+        working_directory=working_directory,
     )
     if result.returncode != 0:
         detail = _clean_text(result.stderr, MAX_AGENT_STDERR_BYTES)
@@ -394,7 +483,7 @@ def _run_claude(prompt: bytearray, timeout_seconds: float) -> str:
     return answer
 
 
-def ask() -> dict[str, object]:
+def ask(*, inherit_agent_config: bool = False) -> dict[str, object]:
     started = time.monotonic()
     agent = detect_agent()
     if _cancel_requested:
@@ -406,12 +495,23 @@ def ask() -> dict[str, object]:
         remaining = ASK_TIMEOUT_SECONDS - (time.monotonic() - started)
         if remaining <= 0:
             raise ProcessDeadline(f"Agent exceeded the {int(ASK_TIMEOUT_SECONDS)}-second deadline.")
-        if agent == "codex":
-            answer = _run_codex(prompt, remaining)
-        elif agent == "claude":
-            answer = _run_claude(prompt, remaining)
-        else:  # Kept explicit so adding an allowlist entry cannot bypass an adapter.
-            raise BridgeError(f"No private-input adapter exists for {agent}.")
+        with tempfile.TemporaryDirectory(prefix="quick-ask-agent-") as working_directory:
+            if agent == "codex":
+                answer = _run_codex(
+                    prompt,
+                    remaining,
+                    inherit_agent_config=inherit_agent_config,
+                    working_directory=working_directory,
+                )
+            elif agent == "claude":
+                answer = _run_claude(
+                    prompt,
+                    remaining,
+                    inherit_agent_config=inherit_agent_config,
+                    working_directory=working_directory,
+                )
+            else:  # Kept explicit so adding an allowlist entry cannot bypass an adapter.
+                raise BridgeError(f"No private-input adapter exists for {agent}.")
         return {"ok": True, "agent": agent, "answer": answer}
     finally:
         for index in range(len(prompt)):
@@ -437,14 +537,22 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGHUP, _handle_signal)
 
-    if len(sys.argv) != 2 or sys.argv[1] not in {"ask", "detect"}:
-        emit({"ok": False, "error": "Usage: quick_ask_helper.py {ask|detect}"})
+    valid_detect = sys.argv == [sys.argv[0], "detect"]
+    valid_ask = len(sys.argv) in {2, 3} and sys.argv[1] == "ask"
+    inherit_agent_config = len(sys.argv) == 3 and sys.argv[2] == "--inherit-agent-config"
+    if not valid_detect and not (valid_ask and (len(sys.argv) == 2 or inherit_agent_config)):
+        emit(
+            {
+                "ok": False,
+                "error": "Usage: quick_ask_helper.py detect | ask [--inherit-agent-config]",
+            }
+        )
         return 2
     try:
-        if sys.argv[1] == "detect":
+        if valid_detect:
             emit({"ok": True, "agent": detect_agent()})
         else:
-            emit(ask())
+            emit(ask(inherit_agent_config=inherit_agent_config))
         return 0
     except (BridgeError, OSError, subprocess.SubprocessError) as error:
         emit({"ok": False, "error": str(error)[:4096]})

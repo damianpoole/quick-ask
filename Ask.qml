@@ -37,14 +37,17 @@ Item {
   readonly property int maxProtocolCharacters: 530000
   readonly property int maxLinkCharacters: 2048
 
-  readonly property string home: Quickshell.env("HOME") || ""
+  readonly property bool inheritAgentConfig: {
+    var value = String(Quickshell.env("QUICK_ASK_INHERIT_AGENT_CONFIG") || "").toLowerCase()
+    return value === "1" || value === "true" || value === "yes"
+  }
+  readonly property string agentMode: root.inheritAgentConfig ? "full configuration" : "restricted"
   readonly property string helperScript: {
     var url = Qt.resolvedUrl("quick_ask_helper.py").toString()
     if (url.indexOf("file://") === 0)
       return decodeURIComponent(url.slice(7))
     return url
   }
-  readonly property string workDir: home + "/Work"
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -65,7 +68,7 @@ Item {
     return Math.min(Style.space(520), panel.height - Style.gapsOut * 2)
   }
   readonly property string hint: root.agentName
-    ? ("Enter to ask · Ctrl+N new · Esc to close · " + root.agentName + " default settings")
+    ? ("Enter to ask · Ctrl+N new · Esc to close · " + root.agentName + " · " + root.agentMode)
     : root.agentStatus
 
   function boundedText(value, maximum) {
@@ -342,7 +345,7 @@ Item {
   Process {
     id: agentProc
     running: false
-    command: ["python3", root.helperScript, "detect"]
+    command: ["/usr/bin/python3", root.helperScript, "detect"]
     stdinEnabled: false
 
     stdout: SplitParser {
@@ -366,8 +369,9 @@ Item {
   Process {
     id: askProc
     running: false
-    command: ["python3", root.helperScript, "ask"]
-    workingDirectory: root.workDir
+    command: root.inheritAgentConfig
+      ? ["/usr/bin/python3", root.helperScript, "ask", "--inherit-agent-config"]
+      : ["/usr/bin/python3", root.helperScript, "ask"]
     stdinEnabled: true
 
     stdout: SplitParser {
