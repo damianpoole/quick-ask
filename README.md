@@ -2,7 +2,8 @@
 
 Quick Ask is a Raycast-style Omarchy overlay for short, conversational answers
 without leaving the current workspace. It uses the authenticated agent selected
-by `omarchy-default-agent` and renders a safe subset of Markdown.
+by `omarchy-default-agent`, isolates that agent's optional configuration by
+default, and renders a safe subset of Markdown.
 
 Follow-up messages are conversational even though the underlying agent CLIs run
 one request at a time. Quick Ask includes up to 24,000 characters of recent
@@ -15,7 +16,8 @@ you close Quick Ask or start a new conversation, and is never written to disk.
 
 - Omarchy Quattro
 - Python 3
-- An installed and authenticated **Codex** or **Claude Code** CLI
+- An installed and authenticated **Codex** CLI with `--ignore-user-config`
+  support, or **Claude Code 2.1.248 or later**
 - That CLI selected with `omarchy default agent codex` or
   `omarchy default agent claude`
 - An explicitly installed Hyprland binding if you want a global shortcut
@@ -88,21 +90,34 @@ omarchy-shell shell toggle damianpoole.ask
 - Select an HTTP(S) link to inspect its destination, then explicitly choose
   **Open** or **Cancel**. Other URL schemes are blocked.
 
-Quick Ask inherits the selected CLI's model, account, and reasoning settings.
-It does not maintain separate model preferences.
+Quick Ask uses the selected CLI's existing authentication but starts it in a
+restricted configuration mode. Codex user configuration and exec-policy rules
+are ignored. Claude user/project customizations, tools, and MCP servers are
+disabled. Both agents run from a new private temporary directory for each ask.
+
+Advanced users can explicitly opt into the selected CLI's full configuration,
+including its model preferences, instructions, hooks, plugins, and external
+tools, by setting `QUICK_ASK_INHERIT_AGENT_CONFIG=1` in the environment of the
+Omarchy shell and restarting the shell. The overlay displays `restricted` or
+`full configuration` beside the agent name so the active boundary remains
+visible. Filesystem restrictions and non-persistence remain enabled in both
+modes.
 
 ## Security boundaries
 
 - Prompts are sent to the helper and agent through stdin, not argv or
   environment variables.
-- Codex final output uses an anonymous in-memory file descriptor. Quick Ask does
-  not create prompt, answer, or log files.
+- Agent subprocesses receive an allowlisted environment containing only common
+  runtime values and authentication variables for the selected adapter.
+- Codex final output uses an anonymous bounded pipe. Quick Ask does not create
+  prompt, answer, or log files.
 - Agent stdout and stderr have raw byte limits and a 120-second total deadline.
 - Agent processes run in a separate process group and are terminated and reaped
   on timeout, overflow, cancellation, or helper shutdown.
 - The optional binding helper caps config and command output, refuses symlinks
-  and writable/unowned targets, uses descriptor-relative atomic replacement,
-  and restores the original file if Hyprland validation fails.
+  and writable/unowned targets, serializes cooperating updates, uses a checked
+  atomic exchange that preserves concurrent edits, and restores the original
+  file if Hyprland validation fails.
 - Codex runs with its read-only sandbox; Claude runs in plan permission mode.
 - User, agent, status, and error strings render as plain text. Assistant Markdown
   has raw HTML and images disabled.

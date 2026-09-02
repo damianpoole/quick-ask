@@ -9,11 +9,14 @@ QML sends one JSON request to `quick_ask_helper.py` through stdin. The helper
 validates its exact schema and UTF-8 byte length, detects the selected agent,
 and starts only a supported adapter. It sends the prompt to that adapter through
 stdin. Prompt content is never placed in argv, an environment variable, or a
-filesystem path.
+filesystem path. Each request runs from a new private temporary directory, which
+is removed when the request ends.
 
-Codex writes its final message to a Linux `memfd` inherited from the helper.
-Claude returns its answer on bounded stdout. Neither path creates a named file.
-Diagnostics are bounded in memory and are not persisted.
+Codex writes its final message to an anonymous pipe inherited from the helper.
+The helper drains and byte-limits that pipe while Codex runs, without applying
+the answer limit to Codex's unrelated internal files. Claude returns its answer
+on bounded stdout. Neither path creates a named file. Diagnostics are bounded in
+memory and are not persisted.
 
 ## Limits
 
@@ -48,6 +51,19 @@ stdin prompt modes and non-interactive, restricted-permission invocation. A
 configured agent without a reviewed private-input adapter is rejected; there is
 no argv fallback.
 
+Restricted configuration is the default. Codex runs with `--ignore-user-config`
+and `--ignore-rules`; Claude runs with `--restricted`, no built-in or MCP tools,
+and no session persistence. Setting `QUICK_ASK_INHERIT_AGENT_CONFIG=1` in the
+Omarchy shell explicitly enables user configuration for the selected adapter.
+The Codex read-only sandbox, Claude plan permission mode, private working
+directory, and session non-persistence remain enforced after that opt-in.
+
+Detection and agent processes receive a small allowlist of runtime, proxy,
+certificate, authentication, locale, and XDG environment variables. Unrelated
+variables from the long-lived shell are not inherited. Executables are pinned to
+the absolute path discovered before launch while preserving multi-call shim
+names required by launchers such as mise.
+
 ## Rendering and external actions
 
 Only assistant answers use Markdown. Control characters are removed, raw HTML
@@ -67,12 +83,15 @@ block in `~/.config/hypr/bindings.lua`.
 
 The helper opens every parent directory and the target with no-follow flags,
 requires a user-owned non-writable parent and regular target, caps the file at
-1 MiB, detects concurrent replacement, and writes through an exclusive random
-temporary file relative to the held parent descriptor. It refuses to steal an
-occupied shortcut. Before each actual change it creates an exclusive 0600
-random backup beside the target. It validates the existing and updated configs
-with `hyprctl reload` and `hyprctl configerrors`; a failed post-write validation
-causes a descriptor-relative rollback to the original bytes.
+1 MiB, and locks the held parent descriptor against another helper invocation.
+It replaces the target with a Linux `renameat2(RENAME_EXCHANGE)` operation, then
+verifies that the exchanged inode is the exact version previously read. A
+concurrent edit is exchanged back and preserved rather than overwritten. It
+refuses to steal an occupied shortcut. Before each actual change it creates an
+exclusive 0600 random backup beside the target. It validates the existing and
+updated configs with `hyprctl reload` and `hyprctl configerrors`; a failed
+post-write validation causes a descriptor-relative rollback to the original
+bytes.
 
 ## Persistent state
 

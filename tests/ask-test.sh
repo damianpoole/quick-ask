@@ -18,7 +18,11 @@ rg -F 'maximumLength: root.maxUserCharacters' "$repo_dir/Ask.qml" >/dev/null
 rg -F 'Text.PlainText' "$repo_dir/Ask.qml" >/dev/null
 rg -F 'var match = candidate.match(/^(https?):\/\/' "$repo_dir/Ask.qml" >/dev/null
 rg -F 'os.O_NOFOLLOW' "$repo_dir/scripts/bindings.py" >/dev/null
+rg -F 'RENAME_EXCHANGE' "$repo_dir/scripts/bindings.py" >/dev/null
 rg -F 'hyprctl", "configerrors' "$repo_dir/scripts/bindings.py" >/dev/null
+rg -F -- '--ignore-user-config' "$repo_dir/quick_ask_helper.py" >/dev/null
+rg -F -- '--restricted' "$repo_dir/quick_ask_helper.py" >/dev/null
+rg -F 'environment=_agent_environment' "$repo_dir/quick_ask_helper.py" >/dev/null
 
 if rg -n 'subprocess\.run|capture_output|\.read_text\(|\.write_text\(' \
   "$repo_dir/scripts/bindings.py"; then
