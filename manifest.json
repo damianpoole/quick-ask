@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "damianpoole.ask",
   "name": "Ask",
-  "version": "1.6.0",
+  "version": "1.0.0",
   "author": "Damian Poole",
   "license": "MIT",
   "description": "Private, bounded conversational overlay for quick Markdown answers from a supported Omarchy default agent.",
