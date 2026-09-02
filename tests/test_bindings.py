@@ -137,6 +137,65 @@ class BindingManagerTests(unittest.TestCase):
                 with self.assertRaises(BINDINGS.BindingError):
                     BINDINGS.binding_status(self.path)
 
+    def test_concurrent_change_during_atomic_exchange_is_preserved(self) -> None:
+        concurrent = '-- Concurrent edit\no.bind("SUPER + C", "Concurrent", "other")\n'
+        original_exchange = BINDINGS._rename_exchange
+        raced = False
+
+        def exchange_with_race(
+            source_directory_fd: int,
+            source_name: str,
+            destination_directory_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal raced
+            if not raced:
+                raced = True
+                self.path.write_text(concurrent, encoding="utf-8")
+            original_exchange(
+                source_directory_fd,
+                source_name,
+                destination_directory_fd,
+                destination_name,
+            )
+
+        with mock.patch.object(BINDINGS, "_rename_exchange", side_effect=exchange_with_race):
+            with self.assertRaisesRegex(BINDINGS.BindingError, "changed during atomic update"):
+                BINDINGS.update_binding(self.path, None, live=False)
+
+        self.assertEqual(self.path.read_text("utf-8"), concurrent)
+        self.assertEqual(len(self.backups()), 1)
+        self.assertEqual(self.backups()[0].read_text("utf-8"), self.original)
+
+    def test_change_that_supersedes_atomic_exchange_is_preserved(self) -> None:
+        concurrent = '-- Superseding edit\no.bind("SUPER + S", "Superseding", "other")\n'
+        original_exchange = BINDINGS._rename_exchange
+        raced = False
+
+        def exchange_then_race(
+            source_directory_fd: int,
+            source_name: str,
+            destination_directory_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal raced
+            original_exchange(
+                source_directory_fd,
+                source_name,
+                destination_directory_fd,
+                destination_name,
+            )
+            if not raced:
+                raced = True
+                self.path.write_text(concurrent, encoding="utf-8")
+
+        with mock.patch.object(BINDINGS, "_rename_exchange", side_effect=exchange_then_race):
+            with self.assertRaisesRegex(BINDINGS.BindingError, "concurrently superseded"):
+                BINDINGS.update_binding(self.path, None, live=False)
+
+        self.assertEqual(self.path.read_text("utf-8"), concurrent)
+        self.assertEqual(list(self.root.glob(".bindings.lua.tmp.quick-ask-*")), [])
+
     @mock.patch.object(BINDINGS, "ensure_key_is_free")
     @mock.patch.object(BINDINGS, "validate_hyprland")
     def test_successful_live_install_checks_key_and_validates_before_and_after(

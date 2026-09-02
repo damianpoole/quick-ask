@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass
+import fcntl
 import os
 from pathlib import Path
 import re
@@ -32,6 +34,7 @@ COMMAND_TIMEOUT_SECONDS = 10.0
 TERM_GRACE_SECONDS = 0.75
 KEY_PATTERN = re.compile(r"^[A-Z0-9_-]+(?:\s*\+\s*[A-Z0-9_-]+)*$")
 ANSI_ESCAPE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+RENAME_EXCHANGE = 2
 
 
 class BindingError(RuntimeError):
@@ -63,6 +66,44 @@ def _file_version(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def _exchange_version(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    """Version fields that remain stable when renameat2 exchanges an entry."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _rename_exchange(
+    source_directory_fd: int,
+    source_name: str,
+    destination_directory_fd: int,
+    destination_name: str,
+) -> None:
+    """Atomically exchange two directory entries using Linux renameat2."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise BindingError("Linux renameat2 support is required for safe atomic replacement")
+    result = renameat2(
+        source_directory_fd,
+        os.fsencode(source_name),
+        destination_directory_fd,
+        os.fsencode(destination_name),
+        RENAME_EXCHANGE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
 
 
 def _clean_output(data: bytes, limit: int = MAX_COMMAND_STDERR_BYTES) -> str:
@@ -197,6 +238,12 @@ class AnchoredBindingFile:
                 raise BindingError(
                     f"refusing to use {self.path}: parent is group- or world-writable"
                 )
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise BindingError(
+                    f"refusing to use {self.path}: another binding update is in progress"
+                ) from error
         except BaseException:
             os.close(directory_fd)
             raise
@@ -294,21 +341,65 @@ class AnchoredBindingFile:
             raise BindingError(f"updated bindings exceed the {MAX_BINDINGS_BYTES}-byte limit")
         temporary_name = f".{self.name}.tmp.quick-ask-{secrets.token_hex(8)}"
         temporary_fd = self._create_file(temporary_name, data, mode)
-        replaced = False
+        exchanged = False
         try:
             self.assert_current(expected)
-            os.replace(
+            new_metadata = os.fstat(temporary_fd)
+            _rename_exchange(
+                self.directory_fd,
                 temporary_name,
+                self.directory_fd,
                 self.name,
-                src_dir_fd=self.directory_fd,
-                dst_dir_fd=self.directory_fd,
             )
-            replaced = True
+            exchanged = True
+
+            replaced_metadata = os.stat(
+                temporary_name,
+                dir_fd=self.directory_fd,
+                follow_symlinks=False,
+            )
+            current_metadata = os.stat(
+                self.name,
+                dir_fd=self.directory_fd,
+                follow_symlinks=False,
+            )
+            if _exchange_version(replaced_metadata) != _exchange_version(expected):
+                if _exchange_version(current_metadata) == _exchange_version(new_metadata):
+                    _rename_exchange(
+                        self.directory_fd,
+                        temporary_name,
+                        self.directory_fd,
+                        self.name,
+                    )
+                    exchanged = False
+                    raise BindingError(
+                        f"refusing to replace {self.path}: file changed during atomic update"
+                    )
+                os.chmod(
+                    temporary_name,
+                    0o600,
+                    dir_fd=self.directory_fd,
+                    follow_symlinks=False,
+                )
+                os.fsync(self.directory_fd)
+                retained_path = self.path.with_name(temporary_name)
+                raise BindingError(
+                    f"refusing to replace {self.path}: multiple concurrent updates occurred; "
+                    f"displaced content was retained at {retained_path}"
+                )
+            if _exchange_version(current_metadata) != _exchange_version(new_metadata):
+                exchanged = False
+                raise BindingError(
+                    f"refusing to replace {self.path}: replacement was concurrently superseded"
+                )
+
+            os.unlink(temporary_name, dir_fd=self.directory_fd)
+            exchanged = False
             os.fsync(self.directory_fd)
-            return os.stat(self.name, dir_fd=self.directory_fd, follow_symlinks=False)
+            return current_metadata
         finally:
             os.close(temporary_fd)
-            if not replaced:
+            if not exchanged:
                 try:
                     os.unlink(temporary_name, dir_fd=self.directory_fd)
                 except FileNotFoundError:
