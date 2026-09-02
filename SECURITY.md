@@ -27,6 +27,9 @@ Diagnostics are bounded in memory and are not persisted.
 | Agent stdout | 256 KiB |
 | Agent stderr | 16 KiB |
 | Agent detection stdout/stderr | 128 bytes / 2 KiB |
+| Hyprland bindings file | 1 MiB |
+| Binding-helper command stdout/stderr | 256 KiB / 16 KiB |
+| Binding-helper command deadline | 10 seconds |
 | Displayed error | 4,096 characters |
 | External URL | 2,048 characters |
 | Retained in-memory transcript | 192,000 characters |
@@ -34,6 +37,9 @@ Diagnostics are bounded in memory and are not persisted.
 
 The helper counts subprocess output before decoding it. Timeout, byte overflow,
 cancellation, and termination all stop and reap the agent process group.
+
+The optional binding helper applies equivalent raw subprocess-output limits and
+deadlines to `omarchy` and `hyprctl` commands before using their results.
 
 ## Supported agents
 
@@ -53,13 +59,28 @@ credentials can reach the confirmation UI. Quick Ask displays the authority and
 full URL as plain text and calls `Qt.openUrlExternally` only after a separate
 user confirmation.
 
+## Optional Hyprland binding helper
+
+Plugin installation and enablement never execute `scripts/bindings.py`. A user
+must invoke it explicitly to add, change, inspect, or remove Quick Ask's marked
+block in `~/.config/hypr/bindings.lua`.
+
+The helper opens every parent directory and the target with no-follow flags,
+requires a user-owned non-writable parent and regular target, caps the file at
+1 MiB, detects concurrent replacement, and writes through an exclusive random
+temporary file relative to the held parent descriptor. It refuses to steal an
+occupied shortcut. Before each actual change it creates an exclusive 0600
+random backup beside the target. It validates the existing and updated configs
+with `hyprctl reload` and `hyprctl configerrors`; a failed post-write validation
+causes a descriptor-relative rollback to the original bytes.
+
 ## Persistent state
 
 Quick Ask does not persist prompts, answers, transcripts, agent output, logs, or
 settings. Agent authentication and defaults remain owned by the selected CLI.
-The plugin never edits Hyprland configuration; the user adds and removes the
-binding manually. Closing Quick Ask or starting a new conversation clears the
-in-memory transcript.
+The optional helper persists only the user-requested marked binding and one
+private backup for each real change. Closing Quick Ask or starting a new
+conversation clears the in-memory transcript.
 
 ## Reporting
 

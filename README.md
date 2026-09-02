@@ -18,10 +18,11 @@ you close Quick Ask or start a new conversation, and is never written to disk.
 - An installed and authenticated **Codex** or **Claude Code** CLI
 - That CLI selected with `omarchy default agent codex` or
   `omarchy default agent claude`
-- A manually configured Hyprland binding
+- An explicitly installed Hyprland binding if you want a global shortcut
 
 Quick Ask deliberately does not install an agent, authenticate accounts, change
-the selected default agent, or edit Hyprland configuration.
+the selected default agent, or edit Hyprland configuration when the plugin is
+installed or enabled.
 
 ## Install
 
@@ -40,15 +41,38 @@ codex exec --ephemeral -s read-only - <<<"Reply with: ready"
 
 For Claude, use `claude -p <<<"Reply with: ready"` for the authentication check.
 
-Add a Hyprland binding to `~/.config/hypr/bindings.lua`:
+Opt into the default **Super+grave** shortcut by running the bundled helper:
 
-```lua
-hl.unbind("SUPER + grave")
-o.bind("SUPER + grave", "Quick Ask", "omarchy-shell shell toggle damianpoole.ask")
+```bash
+python3 ~/.config/omarchy/plugins/damianpoole.ask/scripts/bindings.py install
 ```
 
-Reload Hyprland, then use **Super+grave**. You can test the plugin before adding
-the binding with:
+The helper first verifies that the key is free. If it is already assigned,
+choose another key explicitly:
+
+```bash
+python3 ~/.config/omarchy/plugins/damianpoole.ask/scripts/bindings.py set "SUPER + CTRL + K"
+```
+
+It performs bounded, no-follow reads; creates a private backup; changes only a
+marked Quick Ask block; and rolls back unless both `hyprctl reload` and
+`hyprctl configerrors` succeed. It can also inspect the managed binding:
+
+```bash
+python3 ~/.config/omarchy/plugins/damianpoole.ask/scripts/bindings.py status
+```
+
+For manual setup, first use `omarchy menu keybindings --print` to choose a free
+key. Then add this marked block to `~/.config/hypr/bindings.lua`:
+
+```lua
+-- BEGIN Quick Ask managed binding
+o.bind("SUPER + GRAVE", "Quick Ask", "omarchy-shell shell toggle damianpoole.ask")
+-- END Quick Ask managed binding
+```
+
+Run `hyprctl reload` followed by `hyprctl configerrors` after a manual edit.
+You can test the plugin before adding the binding with:
 
 ```bash
 omarchy-shell shell toggle damianpoole.ask
@@ -76,6 +100,9 @@ It does not maintain separate model preferences.
 - Agent stdout and stderr have raw byte limits and a 120-second total deadline.
 - Agent processes run in a separate process group and are terminated and reaped
   on timeout, overflow, cancellation, or helper shutdown.
+- The optional binding helper caps config and command output, refuses symlinks
+  and writable/unowned targets, uses descriptor-relative atomic replacement,
+  and restores the original file if Hyprland validation fails.
 - Codex runs with its read-only sandbox; Claude runs in plan permission mode.
 - User, agent, status, and error strings render as plain text. Assistant Markdown
   has raw HTML and images disabled.
@@ -95,14 +122,23 @@ rm -f ~/.config/omarchy/plugin-settings/damianpoole.ask.json
 
 ## Remove
 
-First remove the two Quick Ask lines from `~/.config/hypr/bindings.lua`. Then:
+Remove the managed binding while the plugin directory still exists:
+
+```bash
+python3 ~/.config/omarchy/plugins/damianpoole.ask/scripts/bindings.py remove
+```
+
+Then remove the plugin:
 
 ```bash
 omarchy plugin disable damianpoole.ask
 omarchy plugin remove damianpoole.ask
 ```
 
-The plugin creates no persistent conversation data or logs to clean up.
+If you configured the shortcut manually, remove the marked block and validate
+Hyprland instead. The binding helper reports the private backup made beside
+`bindings.lua`; retain or delete that backup according to your own dotfile
+policy. The plugin creates no persistent conversation data or logs.
 
 ## Local development
 
